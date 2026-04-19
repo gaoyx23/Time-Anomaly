@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import numpy as np
 import torch
 import torch.nn as nn
@@ -350,5 +351,3 @@ iso_prec = precision_score(iso_truths, preds_iso, zero_division=0)
 iso_rec = recall_score(iso_truths, preds_iso, zero_division=0)
 
 print(f"Isolation Forest - Precision: {iso_prec:.3f}, Recall: {iso_rec:.3f}, F1-Score: {iso_f1:.3f}")
-
-print("\n--- 第二阶段目标全部达成！ ---")
