@@ -8,6 +8,11 @@ import random
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 
 SEED = 42
 
@@ -38,14 +43,95 @@ def generate_synthetic_data(length=5000, anomaly_ratio=0.05):
         labels[idx] = 1.0
     return data, labels
 
-train_data, train_labels = generate_synthetic_data(length=5000)
-test_data, test_labels = generate_synthetic_data(length=2000)
+
+def build_pseudo_labels(train_raw, test_raw, z_thresh=3.5):
+    median = float(np.median(train_raw))
+    mad = float(np.median(np.abs(train_raw - median)))
+    scale = mad if mad > 1e-6 else np.std(train_raw)
+    scale = scale if scale > 1e-6 else 1.0
+
+    train_score = np.abs(0.6745 * (train_raw - median) / scale)
+    test_score = np.abs(0.6745 * (test_raw - median) / scale)
+    train_labels = (train_score > z_thresh).astype(float)
+    test_labels = (test_score > z_thresh).astype(float)
+    return train_labels, test_labels
+
+
+def load_walmart_series(
+    csv_path,
+    train_ratio=0.7,
+    mode="aggregate",
+    store_id=1,
+    dept_id=1,
+    use_pseudo_labels=True,
+):
+    if pd is None:
+        raise ImportError("需要 pandas 才能读取 walmart_cleaned.csv。")
+
+    df = pd.read_csv(csv_path)
+    if "Date" not in df.columns or "Weekly_Sales" not in df.columns:
+        raise ValueError("CSV 必须包含 Date 和 Weekly_Sales 列。")
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    if mode == "store_dept":
+        df = df[(df["Store"] == store_id) & (df["Dept"] == float(dept_id))]
+        if df.empty:
+            raise ValueError("选定的 Store/Dept 没有数据，请检查 store_id 和 dept_id。")
+        ts = df.sort_values("Date").groupby("Date")["Weekly_Sales"].sum()
+    else:
+        ts = df.sort_values("Date").groupby("Date")["Weekly_Sales"].sum()
+
+    values = ts.to_numpy(dtype=np.float32)
+    split_idx = int(len(values) * train_ratio)
+    if split_idx <= 0 or split_idx >= len(values):
+        raise ValueError("train_ratio 设置不合法，请使用 (0, 1) 之间的值。")
+
+    train_raw = values[:split_idx]
+    test_raw = values[split_idx:]
+
+    scaler = StandardScaler()
+    train_data = scaler.fit_transform(train_raw.reshape(-1, 1)).flatten()
+    test_data = scaler.transform(test_raw.reshape(-1, 1)).flatten()
+
+    if use_pseudo_labels:
+        train_labels, test_labels = build_pseudo_labels(train_raw, test_raw)
+    else:
+        train_labels, test_labels = None, None
+
+    return train_data, train_labels, test_data, test_labels
+
+
+USE_REAL_DATA = True
+REAL_DATA_PATH = "walmart_cleaned.csv"
+REAL_DATA_MODE = "aggregate"  # aggregate 或 store_dept
+STORE_ID = 1
+DEPT_ID = 1
+USE_PSEUDO_LABELS_FOR_EVAL = True
+
 window_size = 10
 
-scaler = StandardScaler()
-# 在生成数据后立即进行归一化
-train_data = scaler.fit_transform(train_data.reshape(-1, 1)).flatten()
-test_data = scaler.transform(test_data.reshape(-1, 1)).flatten()
+if USE_REAL_DATA:
+    train_data, train_labels, test_data, test_labels = load_walmart_series(
+        REAL_DATA_PATH,
+        train_ratio=0.7,
+        mode=REAL_DATA_MODE,
+        store_id=STORE_ID,
+        dept_id=DEPT_ID,
+        use_pseudo_labels=USE_PSEUDO_LABELS_FOR_EVAL,
+    )
+    print(f"数据源: {REAL_DATA_PATH}, 模式: {REAL_DATA_MODE}")
+    print(f"训练长度: {len(train_data)}, 测试长度: {len(test_data)}")
+    if train_labels is not None and test_labels is not None:
+        print(
+            f"伪标签异常占比 - 训练: {np.mean(train_labels):.3f}, "
+            f"测试: {np.mean(test_labels):.3f}"
+        )
+else:
+    train_data, train_labels = generate_synthetic_data(length=5000)
+    test_data, test_labels = generate_synthetic_data(length=2000)
+    scaler = StandardScaler()
+    train_data = scaler.fit_transform(train_data.reshape(-1, 1)).flatten()
+    test_data = scaler.transform(test_data.reshape(-1, 1)).flatten()
 
 def extract_windows(data, window_size):
     windows =[]
@@ -90,6 +176,8 @@ def vae_loss_function(recon_x, x, mu, logvar):
 
 
 def evaluate_vae_baseline(data, labels, vae, threshold, window_size):
+    if labels is None:
+        return None
     windows = extract_windows(data, window_size)
     truth = labels[window_size - 1:]
     model_input = torch.FloatTensor(windows)
@@ -101,7 +189,7 @@ def evaluate_vae_baseline(data, labels, vae, threshold, window_size):
     return {
         "precision": precision_score(truth, preds, zero_division=0),
         "recall": recall_score(truth, preds, zero_division=0),
-        "f1": f1_score(truth, preds),
+        "f1": f1_score(truth, preds, zero_division=0),
     }
 
 print("--- 步骤 1: 开始预训练 VAE ---")
@@ -134,12 +222,15 @@ print(f"VAE 预训练完成! MSE 均值: {mean_error:.4f}, 标准差: {std_error
 print(f"伪异常占比: {pseudo_anomaly_rate:.3f}, 异常奖励权重: {anomaly_reward_weight:.2f}\n")
 
 vae_baseline_test = evaluate_vae_baseline(test_data, test_labels, vae, threshold, window_size)
-print(
-    "VAE 直接阈值基线 - "
-    f"Test Precision: {vae_baseline_test['precision']:.3f}, "
-    f"Recall: {vae_baseline_test['recall']:.3f}, "
-    f"F1-Score: {vae_baseline_test['f1']:.3f}\n"
-)
+if vae_baseline_test is not None:
+    print(
+        "VAE 直接阈值基线 - "
+        f"Test Precision: {vae_baseline_test['precision']:.3f}, "
+        f"Recall: {vae_baseline_test['recall']:.3f}, "
+        f"F1-Score: {vae_baseline_test['f1']:.3f}\n"
+    )
+else:
+    print("VAE 直接阈值基线: 当前数据无标签，跳过监督指标，仅用于无监督训练。\n")
 
 # ==========================================
 # 3. 基于 VAE 的无监督强化学习环境
@@ -165,7 +256,7 @@ class VaeRewardEnv:
 
     def step(self, action):
         state = self._get_obs()
-        true_label = self.labels[self.current_step] # 仅用于测试评估，不用于生成奖励！
+        true_label = self.labels[self.current_step] if self.labels is not None else -1.0
         
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         with torch.no_grad():
@@ -312,17 +403,21 @@ while not done:
     next_state, _, done, true_label = test_env.step(action)
     
     preds_rl.append(action)
-    truths.append(true_label)
+    if true_label >= 0:
+        truths.append(int(true_label))
     state = next_state
 
-# 计算 RL 模型的指标
-rl_f1 = f1_score(truths, preds_rl)
-rl_prec = precision_score(truths, preds_rl, zero_division=0)
-rl_rec = recall_score(truths, preds_rl, zero_division=0)
 rl_positive_rate = float(np.mean(preds_rl))
 
-print(f"RL 模型 (DQN) - Precision: {rl_prec:.3f}, Recall: {rl_rec:.3f}, F1-Score: {rl_f1:.3f}\n")
 print(f"RL 预测为异常的比例: {rl_positive_rate:.3f}\n")
+if truths:
+    eval_preds = preds_rl[-len(truths):]
+    rl_f1 = f1_score(truths, eval_preds, zero_division=0)
+    rl_prec = precision_score(truths, eval_preds, zero_division=0)
+    rl_rec = recall_score(truths, eval_preds, zero_division=0)
+    print(f"RL 模型 (DQN) - Precision: {rl_prec:.3f}, Recall: {rl_rec:.3f}, F1-Score: {rl_f1:.3f}\n")
+else:
+    print("RL 模型 (DQN): 当前数据无标签，跳过监督指标。\n")
 
 
 # ==========================================
@@ -342,11 +437,14 @@ iso_forest.fit(train_windows)
 iso_preds_raw = iso_forest.predict(test_windows)
 preds_iso = [1 if p == -1 else 0 for p in iso_preds_raw]
 
-# 注意：提取窗口后，标签从 window_size-1 开始
-iso_truths = test_labels[window_size-1:]
+if test_labels is not None:
+    # 注意：提取窗口后，标签从 window_size-1 开始
+    iso_truths = test_labels[window_size-1:]
 
-iso_f1 = f1_score(iso_truths, preds_iso)
-iso_prec = precision_score(iso_truths, preds_iso, zero_division=0)
-iso_rec = recall_score(iso_truths, preds_iso, zero_division=0)
+    iso_f1 = f1_score(iso_truths, preds_iso, zero_division=0)
+    iso_prec = precision_score(iso_truths, preds_iso, zero_division=0)
+    iso_rec = recall_score(iso_truths, preds_iso, zero_division=0)
 
-print(f"Isolation Forest - Precision: {iso_prec:.3f}, Recall: {iso_rec:.3f}, F1-Score: {iso_f1:.3f}")
+    print(f"Isolation Forest - Precision: {iso_prec:.3f}, Recall: {iso_rec:.3f}, F1-Score: {iso_f1:.3f}")
+else:
+    print("Isolation Forest: 当前数据无标签，跳过监督指标。")
